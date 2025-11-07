@@ -15,7 +15,10 @@ import traceback
 # ---------------------------
 # Configuration
 # ---------------------------
-OPENAI_API_KEY = "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"
+import os, requests, json, sys
+
+OPENAI_API_KEY =  os.getenv("OPENAI_API_KEY")
+
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 ELEVEN_KEY = "sk_4fcbd8db995d809a60650ff2b2140e895815d5c28af93a19"
 
@@ -1251,3 +1254,4 @@ if __name__ == "__main__":
     print("\nStarting server on http://0.0.0.0:8000")
     print("="*70)
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
