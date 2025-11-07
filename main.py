@@ -1043,7 +1043,210 @@ async def health():
         "output_dir": OUTPUT_DIR,
         "features": "adaptive_duration,step_by_step,procedural_detection"
     }
+# ADD THESE SECTIONS TO YOUR main.py
 
+import uuid
+from typing import Dict
+
+# Add this global dictionary after app initialization
+jobs: Dict[str, dict] = {}
+
+# ADD THIS NEW ENDPOINT (before the existing /generate endpoint)
+@app.post("/generate-async")
+async def generate_async(background_tasks: BackgroundTasks, req: Request):
+    """Start video generation asynchronously and return job ID"""
+    data = await req.json()
+    prompt = (data.get("prompt") or "").strip()
+    quality = data.get("quality", "low")
+    
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    
+    # Generate unique job ID
+    job_id = str(uuid.uuid4())
+    
+    # Store job info
+    jobs[job_id] = {
+        "status": "queued",
+        "prompt": prompt,
+        "quality": quality,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Start background task
+    background_tasks.add_task(process_video_job, job_id, prompt, quality)
+    
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Video generation started"
+    })
+
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    """Get status of a video generation job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    return JSONResponse({
+        "job_id": job_id,
+        "status": job["status"],
+        "error": job.get("error"),
+        "video_path": job.get("video_path")
+    })
+
+
+@app.get("/video/{job_id}")
+async def get_video(job_id: str):
+    """Download the generated video"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Video not ready yet")
+    
+    video_path = job.get("video_path")
+    if not video_path or not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename=f"video_{job_id[:8]}.mp4"
+    )
+
+
+def process_video_job(job_id: str, prompt: str, quality: str):
+    """Background task to process video generation"""
+    try:
+        jobs[job_id]["status"] = "processing"
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tmpdir = tempfile.mkdtemp(prefix="vidgen_")
+        outdir = os.path.join(OUTPUT_DIR, job_id)
+        os.makedirs(outdir, exist_ok=True)
+        
+        print(f"\n[JOB {job_id[:8]}] Starting: {prompt}")
+        
+        # STEP 1: Generate script
+        jobs[job_id]["status"] = "processing"
+        script_data = generate_script_with_gpt4_adaptive(prompt)
+        segments = script_data.get("segments", [])
+        
+        with open(os.path.join(outdir, "script.json"), "w", encoding="utf-8") as f:
+            json.dump(script_data, f, indent=2, ensure_ascii=False)
+        
+        # STEP 2: Generate audio
+        jobs[job_id]["status"] = "generating_audio"
+        audio_paths = generate_all_tts_parallel(segments, tmpdir, max_workers=4)
+        
+        total_duration = sum(seg.get("actual_duration", 5.0) for seg in segments)
+        print(f"[JOB {job_id[:8]}] Total audio: {total_duration:.1f}s")
+        
+        # STEP 3: Concatenate audio
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for p in audio_paths:
+                f.write(f"file '{p.replace(chr(92), '/')}'\n")
+        
+        final_audio = os.path.join(tmpdir, "voice.mp3")
+        res = run_cmd([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-c:a", "libmp3lame", "-q:a", "2", final_audio
+        ], timeout=120)
+        
+        if res.returncode != 0:
+            raise Exception("Audio concatenation failed")
+        
+        shutil.copy2(final_audio, os.path.join(outdir, "audio.mp3"))
+        
+        # STEP 4: Generate Manim scene
+        jobs[job_id]["status"] = "rendering"
+        scene_code = generate_manim_scene_adaptive(segments)
+        
+        scene_path = os.path.join(tmpdir, "scene.py")
+        with open(scene_path, "w", encoding="utf-8") as f:
+            f.write(scene_code)
+        
+        shutil.copy2(scene_path, os.path.join(outdir, "scene.py"))
+        
+        if not validate_and_fix_scene(scene_path, outdir):
+            raise Exception("Scene validation failed")
+        
+        # STEP 5: Render with Manim
+        manim_log = os.path.join(outdir, "manim_render.log")
+        returncode = run_manim_with_logging(scene_path, quality, tmpdir, manim_log)
+        
+        if returncode != 0:
+            raise Exception("Manim render failed")
+        
+        # Find rendered video
+        video_path = None
+        media_dir = os.path.join(tmpdir, "media")
+        
+        for root, dirs, files in os.walk(media_dir):
+            for fname in files:
+                if fname.endswith(".mp4"):
+                    video_path = os.path.join(root, fname)
+                    break
+            if video_path:
+                break
+        
+        if not video_path or not os.path.exists(video_path):
+            raise Exception("Rendered video not found")
+        
+        shutil.copy2(video_path, os.path.join(outdir, "video_only.mp4"))
+        
+        # STEP 6: Merge audio + video
+        jobs[job_id]["status"] = "finalizing"
+        final_out = os.path.join(outdir, "final_output.mp4")
+        
+        merge_cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", final_audio,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            final_out
+        ]
+        
+        merge_res = run_cmd(merge_cmd, timeout=120)
+        if merge_res.returncode != 0:
+            raise Exception("Audio/Video merge failed")
+        
+        # Success!
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["video_path"] = final_out
+        
+        print(f"\n[JOB {job_id[:8]}] ✅ Completed: {total_duration:.1f}s video")
+        
+        # Cleanup temp dir
+        cleanup_temp_dir(tmpdir)
+        
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+        print(f"\n[JOB {job_id[:8]}] ❌ Failed: {e}")
+        traceback.print_exc()
+        
+        # Save error log
+        try:
+            with open(os.path.join(outdir, "error.txt"), "w") as f:
+                f.write(f"Error: {type(e).__name__}\n")
+                f.write(f"Message: {str(e)}\n\n")
+                f.write(traceback.format_exc())
+        except:
+            pass
+
+
+# KEEP YOUR EXISTING /generate ENDPOINT FOR BACKWARD COMPATIBILITY
+# (Optional - you can remove it if you only want async)
 if __name__ == "__main__":
     import uvicorn
     print("="*70)
@@ -1060,4 +1263,5 @@ if __name__ == "__main__":
     print("="*70)
     print("\nStarting server on http://0.0.0.0:8000")
     print("="*70)
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
